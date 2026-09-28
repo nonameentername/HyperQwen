@@ -1,0 +1,54 @@
+--- a/entrypoints/openai/api_server.py
++++ b/entrypoints/openai/api_server.py
+@@ -16,7 +16,7 @@
+ from typing import Any, cast
+ 
+ import uvloop
+-from fastapi import FastAPI
++from fastapi import FastAPI, Request
+ from fastapi.middleware.cors import CORSMiddleware
+ from starlette.datastructures import State
+ 
+@@ -206,6 +206,42 @@
+         app = FastAPI(lifespan=lifespan)
+     app.state.args = args
+ 
++    # Compatibility endpoint for clients that probe the server root
++    # before using the OpenAI-compatible API.
++    @app.api_route(
++        "/",
++        methods=["GET", "HEAD"],
++        include_in_schema=False,
++    )
++    async def root():
++        return {"status": "ok"}
++
++    # Minimal Ollama compatibility endpoints used by `ollama launch codex`.
++    @app.get("/api/status", include_in_schema=False)
++    async def ollama_status():
++        return {"status": "ok"}
++
++    @app.get("/api/experimental/model-recommendations", include_in_schema=False)
++    async def ollama_model_recommendations():
++        return {"models": []}
++
++    @app.post("/api/show", include_in_schema=False)
++    async def ollama_show(request: Request):
++        body = await request.json()
++        model = body.get("model", "")
++
++        if model not in ("qwen3.8:27b", "qwen3.8-27b"):
++            return {"error": f"model '{model}' not found"}
++
++        return {
++            "model_info": {
++                "general.context_length": 65536,
++            },
++            "details": {
++                "parameter_size": "27B",
++            },
++        }
++
+     from vllm.entrypoints.serve import register_vllm_serve_api_routers
+ 
+     register_vllm_serve_api_routers(app)
