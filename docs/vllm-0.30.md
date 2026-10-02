@@ -55,7 +55,8 @@ Adapted to upstream #54809, which removed GPTQ activation ordering (`has_g_idx`,
 
 - `marlin-int8-negative-scales`: the `has_g_idx` guard is gone. **Without this, every `INT8_ACT=int8` boot (batch
   mode's default, and single-user with `INT8_ACT`) died at load** with an AttributeError.
-- `marlin-repack-staged-sm80`: the staged repack no longer passes `perm` (sm80, or `VLLM_MARLIN_REPACK_STAGED=1`).
+- `marlin-repack-staged-sm80`: the staged repack no longer passes `perm` (`VLLM_MARLIN_REPACK_STAGED=1`; it was on for
+  sm80 by default until it went opt-in).
 - `marlin-tune-table`: the standalone tuned build keeps its 0.27.1 schema and gets `None, None` and
   `is_k_full=True` (off by default; not booted, it needs the standalone build).
 
@@ -113,8 +114,9 @@ on 0.29, with no cold-vs-warm cost, but on 0.30 the default profile makes five c
 kernels (`_topp_sb_stats`, `_topp_sb_step` x3, `_topp_sb_mask`, all at `S=4`), and the first request's TTFT reads
 3,433 ms cold against 1,579 ms warm (n=1). The kernels are real but unwarmed on CUDA: the V2 runner's sampler never
 registers them, and vllm #58465 limited their registration to ROCm because on CUDA it "adds ~2 min to every engine
-start". The cost is once per cold Triton cache (the cache lives on the `qwen-cache` volume), and the #155 follow-up
-carries vllm #58092's registration for CUDA, on a branch stacked on this one. The monitor also counts compiled kernels
+start". The cost is once per cold Triton cache (the cache lives on the `qwen-cache` volume). `sampler-warmup-cuda`
+carries vllm #58092's registration without #58465's gate: 0 in-request compiles, at 71 s (default) / 78 s
+(dflash2 k7) of boot warmup once per cold volume and ~0.2 s warm (reference 3090, #155). The monitor also counts compiled kernels
 loaded from the disk cache, so on a warm volume its count is not the cost; read the latency. On the WSL2 4090, the
 int8 prefill profile logs the same four in-request compiles on both pins, of three kernels (`_k_quant`, `_k_stats`,
 `_prefill_attn` twice), which is the positive control that the counter works.
@@ -167,7 +169,8 @@ tell the two apart (the EAGLE drop caps both at the same boundary); only an exte
 
 So both single-user launchers pass the interval on every draft profile: the measured one for `CTX=huge SPEC=dflash2`
 (13056 at 7 drafts, 14592 at 15), else `None`, which is 0.29's behaviour. `PREFIX_RETENTION=0` asks for boundaries
-only, and a flag in `EXTRA_ARGS` wins. Batch mode runs no draft, so #55760 never applied to it and nothing changes.
+only, and a flag in `EXTRA_ARGS` wins. (Since the port, `alternative.sh` passes `0` when no KV tier is configured and
+`None` when one is; gotcha 60 has why. The verification below was run before that change.) Batch mode runs no draft, so #55760 never applied to it and nothing changes.
 Verified on the reference 3090 with the launchers read out of the image against the commit: the default MTP profile
 shows `'prefix_cache_retention_interval': None` in the engine's arguments and its turn 2 hits S1 (20,304, 92.0%);
 alternative.sh shows None and keeps its 302,094 pool; `CTX=huge SPEC=dflash2` keeps 13056 (pool 268,169) and still
@@ -225,4 +228,5 @@ Two lessons for the reading:
    the GPU tier's EAGLE drop, which 0.29 never did.
 7. **Draft profiles pass `--prefix-cache-retention-interval None` unless measured or set**, keeping 0.29's multi-turn
    reuse. Boundaries-only (0.30's default) is one `PREFIX_RETENTION=0` away, and would be the better choice for many
-   alternating long conversations on a small pool (gotcha 60); this port does not change that trade.
+   alternating long conversations on a small pool (gotcha 60); this port does not change that trade. After it,
+   `alternative.sh` took `0` as its default when no KV tier is configured, from the two-conversation measurement.

@@ -776,6 +776,10 @@ export PATH="$REPO/venv/bin:$PATH"
 # and turning it off costs you the top of the GPU_UTIL range.
 if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
   ALLOC_DEFAULT=expandable_segments:False
+  if [ "${SPEC:-mtp}" = dflash2 ] && [ -z "${VLLM_WSL2_ENABLE_PIN_MEMORY:-}" ]; then
+    export VLLM_WSL2_ENABLE_PIN_MEMORY=1
+    echo "WSL detected + SPEC=dflash2: VLLM_WSL2_ENABLE_PIN_MEMORY=1 (V2 runner needs pinned UVA buffers here; set it explicitly to override)"
+  fi
   [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && echo \
     "WSL detected: PYTORCH_CUDA_ALLOC_CONF=$ALLOC_DEFAULT (VMM breaks Marlin repack under the paravirt driver; set it explicitly to override)"
 else
@@ -815,10 +819,11 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 
 source "$REPO/resolve_api_key.sh"
 resolve_vllm_key
+resolve_bind_host
 
 exec venv/bin/vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
-  --host ${HOST:-0.0.0.0} --port $PORT \
+  --host $BIND_HOST --port $PORT \
   --gpu-memory-utilization $GPU_UTIL \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \

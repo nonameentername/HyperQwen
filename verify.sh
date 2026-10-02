@@ -6,14 +6,33 @@
 #
 #   bash verify.sh            # everything
 #   bash verify.sh --no-server
+#   bash verify.sh --wait 300 # wait up to 300 s for /health before grading live
 #   bash verify.sh --install  # only the install (venv, vLLM, patches, KVarN): no GPU,
 #                             # model or server checks — what the Docker build runs
 # Exit code: 0 all PASS (WARNs allowed), 1 if anything FAILs.
+# --wait SECONDS (default 0 = check /health once, as before) polls
+# GET /health until 200 before grading the live section. Accepts --wait 300
+# or --wait=300. VERIFY_SERVER_PID (optional) aborts the wait early if that
+# pid dies, mirroring single-user/qwen-server.sh's server-death detection
+# (verify.sh owns no child, so the pid is opt-in rather than built in).
 # PY=/path/to/python overrides the interpreter (default: this repo's venv).
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
-NOSRV=0; INSTALL=0
-for a in "$@"; do case "$a" in --no-server) NOSRV=1;; --install) INSTALL=1; NOSRV=1;; esac; done
+NOSRV=0; INSTALL=0; WAIT=0
+_WAIT_ARG=0
+for a in "$@"; do
+  if [ "$_WAIT_ARG" = 1 ]; then
+    case "$a" in ''|*[!0-9]*) echo "verify.sh: --wait needs a non-negative integer number of seconds (got '$a')" >&2; exit 2;; *) WAIT=$a;; esac
+    _WAIT_ARG=0; continue
+  fi
+  case "$a" in
+    --no-server) NOSRV=1;;
+    --install) INSTALL=1; NOSRV=1;;
+    --wait) _WAIT_ARG=1;;
+    --wait=*) _WAIT_VAL=${a#--wait=}; case "$_WAIT_VAL" in ''|*[!0-9]*) echo "verify.sh: --wait needs a non-negative integer number of seconds (got '$_WAIT_VAL')" >&2; exit 2;; *) WAIT=$_WAIT_VAL;; esac;;
+  esac
+done
+if [ "$_WAIT_ARG" = 1 ]; then echo "verify.sh: --wait needs a value: --wait SECONDS" >&2; exit 2; fi
 FAILS=0
 ok()   { printf "  PASS  %s\n" "$1"; }
 warn() { printf "  WARN  %s\n" "$1"; }
@@ -54,17 +73,14 @@ echo "== vLLM patches (order: patches/series)"
 # order, but the earlier one's lines are no longer in the tree, so neither check
 # above can see it. The later patch declares "Supersedes: <basename>" in its header;
 # that only counts if the later patch is itself applied (#67 over #57).
-SERIES=()
-while IFS= read -r name; do
-  SERIES+=("$name")
-done < <(sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' patches/series)
-ON_DISK=$(for f in patches/*.patch; do basename "$f"; done | sort)
-IN_SERIES=$(printf '%s\n' "${SERIES[@]}" | sort)
-if [ "$ON_DISK" = "$IN_SERIES" ]; then
+# patches/apply.sh --list prints the series even when it and patches/ disagree, so the
+# checks below still run; the disagreement is a FAIL with each offender named.
+mapfile -t SERIES < <(bash patches/apply.sh --list 2>/dev/null)
+if LIST_ERR=$(bash patches/apply.sh --list 2>&1 >/dev/null); then
   ok "patches/series lists all ${#SERIES[@]} patches"
 else
   fail "patches/series out of sync with patches/ (a patch not in series is never applied):"
-  comm -3 <(printf '%s\n' "$ON_DISK") <(printf '%s\n' "$IN_SERIES") | sed 's/^/    /'
+  printf '%s\n' "$LIST_ERR" | sed '1d'
 fi
 superseded_by() {
   local target="$1" q
@@ -79,10 +95,6 @@ superseded_by() {
 # can no longer be reversed individually once both are applied; then look for their content.
 for name in "${SERIES[@]}"; do
   p="patches/$name"
-  if [ "$name" = "dflash2-backport.patch" ]; then
-    ok "dflash2-backport.patch retired (DFlash2 is native since vLLM 0.28.0)"
-    continue
-  fi
   if patch -p1 -R --dry-run -s --fuzz 0 -d "$SP" < "$p" >/dev/null 2>&1; then ok "$name applied"
   elif $PY patches/_check_applied.py "$p" "$SP" 2>/dev/null; then ok "$name applied (content check; hunks overlap another patch)"
   elif s=$(superseded_by "$name"); then ok "$name applied (superseded by $s, which is applied)"
@@ -98,13 +110,16 @@ if [ -f "$SP/v1/attention/backends/kvarn_attn.py" ]; then
   if patch -p1 -R --dry-run -s --fuzz 0 -d "$SP" < kvarn/kvarn-0.30.0.patch >/dev/null 2>&1; then
     $PY -c "from vllm.v1.attention.backends.registry import AttentionBackendEnum; AttentionBackendEnum.KVARN.get_class()" 2>/dev/null && ok "KVarN backend importable, patch applied (KV=kvarn / CTX=huge available)" || fail "KVarN files present but backend does not import"
   else fail "KVarN modules present but kvarn-0.30.0.patch not applied (bash kvarn/install.sh)"; fi
-  if $PY patches/_check_applied.py kvarn/kvarn-v2-runner-0.30.0.patch "$SP" >/dev/null 2>&1; then
+  # Exact, like the kvarn-0.30.0 check above: each KVarN patch reverses cleanly on its own in a fully
+  # installed tree. The content check (_check_applied.py) passes a tree that misses one hunk in a file
+  # whose other hunks carry most of the added lines, so it is not used here.
+  if patch -p1 -R --dry-run -s --fuzz 0 -d "$SP" < kvarn/kvarn-v2-runner-0.30.0.patch >/dev/null 2>&1; then
     ok "kvarn-v2-runner-0.30.0.patch applied (SPEC=dflash2 + CTX=huge available)"
-  else warn "kvarn-v2-runner-0.30.0.patch not applied (re-run bash kvarn/install.sh for DFlash2 at 240k)"; fi
-  if $PY patches/_check_applied.py kvarn/kvarn-recycled-pages-0.30.0.patch "$SP" >/dev/null 2>&1 \
+  else warn "kvarn-v2-runner-0.30.0.patch not applied, or partly applied (re-run bash kvarn/install.sh for DFlash2 at 240k)"; fi
+  if patch -p1 -R --dry-run -s --fuzz 0 -d "$SP" < kvarn/kvarn-recycled-pages-0.30.0.patch >/dev/null 2>&1 \
       && grep -q "def note_scheduled_blocks" "$SP/v1/attention/backends/kvarn_attn.py"; then
     ok "kvarn-recycled-pages-0.30.0.patch applied (no late KVarN flush into mamba state, #208)"
-  else warn "kvarn-recycled-pages-0.30.0.patch not applied: CTX=huge + PREFIX_CACHE=1 can print \"!!!!\" (#208; bash kvarn/install.sh)"; fi
+  else warn "kvarn-recycled-pages-0.30.0.patch not applied, or partly applied: CTX=huge + PREFIX_CACHE=1 can print \"!!!!\" (#208; bash kvarn/install.sh)"; fi
 else warn "KVarN not installed (optional; bash kvarn/install.sh for 262k context)"; fi
 
 if [ $INSTALL = 0 ]; then
@@ -305,9 +320,18 @@ else warn "no DFlash2 drafter (venv/bin/python prepare/fetch_dflash2.py; SPEC=df
 echo "== keys / units"
 # A key is optional: with neither api_key.txt nor VLLM_API_KEY the launchers export
 # nothing and vLLM serves unauthenticated, which is a fine way to run this locally.
-# Worth a WARN rather than silence only because both launchers bind 0.0.0.0.
-[ -s api_key.txt ] || [ -n "${VLLM_API_KEY:-}" ] && ok "API key configured (api_key.txt or VLLM_API_KEY)" \
-  || warn "no API key — the server will accept any request, and it listens on 0.0.0.0. Fine behind a firewall; otherwise: openssl rand -hex 24 > api_key.txt"
+# With no key the launchers bind 127.0.0.1 (resolve_bind_host in resolve_api_key.sh), so that is a WARN.
+# It is a FAIL only when the bind is explicitly set off loopback (HOST=0.0.0.0 and no key). A container
+# keeps 0.0.0.0 by default, so a keyless container is a WARN: the published port is what limits it.
+if [ -s api_key.txt ] || [ -n "${VLLM_API_KEY:-}" ]; then ok "API key configured (api_key.txt or VLLM_API_KEY)"
+else
+  case "${HOST:-}" in
+    "") if [ -f /.dockerenv ]; then warn "no API key — this container listens on 0.0.0.0, so the published port is open to whatever can reach it. Set VLLM_API_KEY (make keygen) or publish the port on 127.0.0.1 only"
+        else warn "no API key — the server binds 127.0.0.1 only, so other machines cannot reach it. To serve them: openssl rand -hex 24 > api_key.txt"; fi ;;
+    127.*|localhost|::1) warn "no API key — HOST=$HOST keeps the server on this machine" ;;
+    *) fail "no API key and HOST=$HOST: anything that can reach this port can use the server. openssl rand -hex 24 > api_key.txt, or unset HOST" ;;
+  esac
+fi
 if [ -f /.dockerenv ]; then :; elif systemctl --user is-active qwen-serving >/dev/null 2>&1; then ok "systemd user unit qwen-serving active"; else warn "qwen-serving unit not active (fine if you launch the scripts by hand)"; fi
 # VLLM_SKIP_MODEL_NAME_VALIDATION looks like a fix for model-name 404s, but it
 # disables the check on every endpoint (/v1/chat/completions included): a
@@ -321,6 +345,21 @@ fi  # INSTALL
 if [ $NOSRV = 0 ]; then
   echo "== live server (127.0.0.1:${PORT:-18020})"
   PORT=${PORT:-18020}
+  if [ "$WAIT" -gt 0 ]; then
+    # Bounded poll for /health, same shape as single-user/qwen-server.sh:
+    # fixed 5 s interval, at most WAIT seconds, abort if the server pid dies.
+    echo "verify: waiting up to ${WAIT}s for http://127.0.0.1:$PORT/health ..."
+    _WAIT_N=$(( (WAIT + 4) / 5 )); _WAIT_HIT=0
+    for _w in $(seq 1 "$_WAIT_N"); do
+      if [ -n "${VERIFY_SERVER_PID:-}" ] && ! kill -0 "$VERIFY_SERVER_PID" 2>/dev/null; then
+        echo "verify: server process $VERIFY_SERVER_PID exited before becoming healthy" >&2
+        break
+      fi
+      if curl -sf -o /dev/null "http://127.0.0.1:$PORT/health"; then _WAIT_HIT=1; break; fi
+      sleep 5
+    done
+    [ "$_WAIT_HIT" = 1 ] && echo "verify: /health 200 after waiting"
+  fi
   if curl -sf -o /dev/null http://127.0.0.1:$PORT/health; then
     ok "/health 200"
     KEY=${VLLM_API_KEY:-$(cat api_key.txt 2>/dev/null)}
